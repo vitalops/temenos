@@ -2,6 +2,8 @@
 
 # temenos
 
+<img src="assets/octopus.png" alt="temenos octopus mascot — a friendly octopus inside a glowing box" width="280" />
+
 **A secure runtime for AI agents.** 🏛️
 
 *Your agent runs on the host — the code it executes runs in a gVisor box.*
