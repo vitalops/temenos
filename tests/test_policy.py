@@ -11,8 +11,20 @@ from temenos import Policy, PolicyViolation
 def test_default_policy_fs_locked_network_open():
     p = Policy()
     assert p.read == () and p.write == ()          # filesystem locked (overlay only)
-    assert p.network is True                        # v1 default: host network passthrough
+    assert p.network == "host"                      # default: host network passthrough
+    assert bool(p.network) is True
     assert p.max_memory_mb == 256
+
+
+def test_network_truthiness_still_means_what_v1_meant():
+    """`network` grew from a bool to three modes. The natural v1 expression —
+    `if policy.network:` — has to keep meaning "has network", or a plain
+    string (`bool("none") is True`) would silently treat an isolated box as a
+    connected one and nothing would fail."""
+    assert bool(Policy(network=False).network) is False
+    assert bool(Policy(network="none").network) is False
+    assert bool(Policy(network=True).network) is True
+    assert bool(Policy(network="filtered", allow_hosts=["a.com"]).network) is True
 
 def test_lists_are_coerced_to_tuples_and_deduped():
     p = Policy(read=["/a", "/b", "/a"])
@@ -45,7 +57,7 @@ def test_restrict_narrows():
     parent = Policy(read=["/a", "/b"], network=True, max_memory_mb=512)
     child = parent.restrict(read=["/a"], network=False, max_memory_mb=128)
     assert child.read == ("/a",)
-    assert child.network is False
+    assert child.network == "none"
     assert child.max_memory_mb == 128
 
 def test_restrict_inherits_unpassed_fields():
@@ -71,21 +83,52 @@ def test_restrict_widening_raises(kwargs):
 
 
 def test_restrict_can_disable_network_not_enable():
-    assert Policy(network=True).restrict(network=False).network is False
+    assert Policy(network=True).restrict(network=False).network == "none"
     with pytest.raises(PolicyViolation):
         Policy(network=False).restrict(network=True)
 
 
-def test_network_toggle_defaults_on_and_coerces():
-    assert Policy().network is True                 # v1 default is host passthrough
-    assert Policy(network=False).network is False
-    assert Policy(network=True).network is True
-    assert Policy(network="host").network is True
-    assert Policy(network="none").network is False
+def test_restrict_walks_down_the_modes_and_never_up():
+    """host > filtered > none. Narrowing to a *tighter* mode is the only
+    direction, and every step of it is a step somebody can take."""
+    host = Policy(network="host")
+    assert host.restrict(network="filtered").network == "filtered"
+    assert host.restrict(network="none").network == "none"
+
+    filtered = Policy(network="filtered", allow_hosts=["a.com"])
+    assert filtered.restrict(network="none").network == "none"
+    with pytest.raises(PolicyViolation):
+        filtered.restrict(network="host")
+    with pytest.raises(PolicyViolation):
+        Policy(network="none").restrict(network="filtered")
+
+
+def test_narrowing_out_of_filtered_drops_the_allowlist():
+    """A box that no longer filters must not carry hosts nothing consults —
+    that reads like containment and is not."""
+    filtered = Policy(network="filtered", allow_hosts=["a.com"])
+    assert filtered.restrict(network="none").allow_hosts == ()
+
+
+def test_an_allowlist_without_filtering_is_refused():
     with pytest.raises(ValueError):
-        Policy(network="evil.com")        # old allowlist form is gone in v1
+        Policy(network="host", allow_hosts=["a.com"])
     with pytest.raises(ValueError):
-        Policy(network=["a", "b"])         # a list is not a toggle
+        Policy(network=False, allow_hosts=["a.com"])
+
+
+def test_network_modes_default_and_coerce():
+    assert Policy().network == "host"                # default is host passthrough
+    assert Policy(network=False).network == "none"
+    assert Policy(network=True).network == "host"
+    assert Policy(network="host").network == "host"
+    assert Policy(network="none").network == "none"
+    assert Policy(network="filtered", allow_hosts=["a.com"]).network == "filtered"
+    assert Policy(network="proxy", allow_hosts=["a.com"]).network == "filtered"
+    with pytest.raises(ValueError):
+        Policy(network="evil.com")        # a host is not a mode
+    with pytest.raises(ValueError):
+        Policy(network=["a", "b"])         # nor is a list
 
 def test_restrict_unknown_field_raises_typeerror():
     with pytest.raises(TypeError):
@@ -125,9 +168,14 @@ def test_path_prefix_is_not_fooled_by_sibling():
 def test_root_read_allows_everything():
     assert Policy(read=["/"]).allows_path_read("/etc/hosts")
 
-def test_network_round_trips_as_bool():
-    assert Policy(network=True).to_dict()["network"] is True
-    assert Policy.from_dict({"network": "host"}).network is True
+def test_network_round_trips_as_a_mode():
+    assert Policy(network=True).to_dict()["network"] == "host"
+    assert Policy.from_dict({"network": "host"}).network == "host"
+    # Plain `str` in the dict, so JSON round-trips without a custom encoder.
+    assert type(Policy(network=True).to_dict()["network"]) is str
+
+    filtered = Policy(network="filtered", allow_hosts=["*.acme.com"])
+    assert Policy.from_dict(filtered.to_dict()) == filtered
 
 
 def test_checkpoint_mode_defaults_and_validates():

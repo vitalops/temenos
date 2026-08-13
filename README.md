@@ -77,7 +77,7 @@ repo, or run it fifty times in parallel under one daemon — same boundary eithe
 | A VM-per-task sandbox | The agent stays on the **host** (auth, updates, model API intact). Spinning a VM per task throws all that away; temenos boxes only what runs. |
 | A seccomp / AppArmor filter | gVisor is a full userspace kernel, not a syscall allowlist bolted onto the host kernel — a categorically larger isolation boundary. |
 | A defense against a malicious *agent* | The threat model trusts the agent binary. temenos contains the untrusted **code the agent runs**, not the agent itself. |
-| A network firewall | v1 network is a toggle: **full passthrough by default** (no filtering) or **off** (`--no-net`, isolated). Filtered per-host egress is post-v1 — the load-bearing gap for adversarial fleets (see limits). |
+| A network firewall | Three modes: **full passthrough by default**, **off** (`--no-net`, isolated), or **filtered** (`--filtered --allow-host …`, a per-box allowlist proxy). Filtered is *cooperative* — honoured by well-behaved clients, ignored by hostile code that opens its own sockets. Containment is still `--no-net` (see limits). |
 
 ## ⚖️ How it compares
 

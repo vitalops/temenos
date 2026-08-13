@@ -4,6 +4,33 @@ All notable changes to **temenos** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-13
+
+### Added
+- **Filtered egress (`network="filtered"`).** A per-box allowlist proxy: `--filtered
+  --allow-host api.acme.com --allow-host '*.stripe.com'`. Default-deny, `host` or
+  `host:port` entries, `*.` wildcards for subdomains, IP literals only when written
+  exactly, and cloud-metadata addresses refused by name. Refusals come back as a `403`
+  with a readable body, so a tool inside the box surfaces something a model can act on.
+  Bytes are metered per host — egress is a billing surface as well as a security one.
+- **`temenos.net`** — `HostAllowlist` and `EgressProxy`, usable on their own.
+
+### Changed
+- **`Policy.network` is now `"none" | "filtered" | "host"`** rather than a bool. Bools
+  still work on the way in (`False`→`"none"`, `True`→`"host"`), and the value is a `str`
+  subclass whose truthiness is unchanged — `if policy.network:` still means "has
+  network", which a plain string would have silently inverted for `"none"`.
+- `Policy.allow_hosts` is refused unless `network="filtered"`; an allowlist nothing
+  consults reads like containment and is not. Narrowing out of `filtered` drops it.
+- `restrict()` walks `host → filtered → none` and refuses any step back up.
+
+### Honest limits
+- **`filtered` is cooperative, not enforced.** The box is pointed at the proxy via
+  `HTTPS_PROXY`; hostile code that ignores the variable reaches the network directly,
+  because a `filtered` box still shares the host netns. Enforcement needs pasta + nft
+  TPROXY (`plan.md` §13) and is not built. `EgressProxy.enforced` is `False` and says so.
+  For adversarial or multi-tenant workloads, `network="none"` remains the answer.
+
 ## [0.3.0] — 2026-06-07
 
 ### Added

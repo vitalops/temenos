@@ -48,6 +48,7 @@ class GVisorBackend(Backend):
         self._held: subprocess.Popen | None = None
         self._policy: Policy | None = None
         self._base_env: dict[str, str] = {}
+        self._proxy = None  # RunningProxy for network='filtered' boxes
 
     # -- availability / platform detection -------------------------------------------
 
@@ -88,8 +89,16 @@ class GVisorBackend(Backend):
     # -- flag construction ------------------------------------------------------------
 
     def _net_mode(self) -> str:
-        # v1 simple toggle: full passthrough (host) or isolated (none). No filtering.
-        return "host" if (self._policy and self._policy.network) else "none"
+        """What `runsc --network` gets: `host` or `none`, and nothing else.
+
+        `filtered` is `host` at this layer plus a proxy the box is pointed at.
+        runsc has no third mode to ask for — confining the box *to* the proxy
+        is a network namespace built around it (plan §13), which is why
+        `EgressProxy.enforced` says False.
+        """
+        if self._policy is None or self._policy.network == "none":
+            return "none"
+        return "host"
 
     def _overlay2(self) -> str:
         # disk (default): root overlay backed on disk → not RAM-bound AND checkpointable.
@@ -137,11 +146,18 @@ class GVisorBackend(Backend):
             raise BackendError("restore needs a disk-backed overlay; use scratch='disk'")
         if restore_from and not os.path.isdir(restore_from):
             raise BackendError(f"restore checkpoint dir not found: {restore_from!r}")
-        if policy.network:
+        if policy.network == "host":
             log.warning("box %s: network=host (full passthrough, NO firewalling) — the "
                         "box can reach localhost, the LAN, cloud metadata, and exfiltrate "
                         "anywhere. Operator opt-in only; unsafe for adversarial tenants.",
                         name)
+        elif policy.network == "filtered":
+            log.warning("box %s: network=filtered is COOPERATIVE, not enforced — the box "
+                        "is pointed at an allowlist proxy via HTTPS_PROXY, which every "
+                        "well-behaved client honours and hostile code ignores. It stops "
+                        "an agent's tools and `pip` reaching the wrong host; it does not "
+                        "contain an attacker. For that, still network='none'. (Enforcing "
+                        "it needs pasta + nft TPROXY — plan.md §13.)", name)
         # read paths must already exist (host data we expose). write paths are durable
         # disk binds — created if missing (the box's output dir). Box-internal scratch
         # should use the always-present /tmp or a MemoryVolume.
@@ -159,6 +175,16 @@ class GVisorBackend(Backend):
 
         self._policy = policy
         self._base_env = dict(env or {})
+        if policy.network == "filtered":
+            # Started before the box so its address exists to be injected: a
+            # box whose HTTPS_PROXY points at an unbound port fails its first
+            # request with a connection refused nobody can explain.
+            from ..net.runner import start_proxy
+
+            self._proxy = start_proxy(policy.allow_hosts, box=name)
+            self._base_env.update(self._proxy.env())
+            log.info("box %s: egress via %s (%d allowed)", name, self._proxy.url,
+                     len(policy.allow_hosts))
         self._cid = name or f"temenos-{uuid.uuid4().hex[:12]}"
         if self._work_dir:
             os.makedirs(self._work_dir, exist_ok=True)
@@ -178,7 +204,10 @@ class GVisorBackend(Backend):
         # let each storage provider set up its backing (mkdir, download, …) before start
         for m in policy.mounts:
             m.provider.prepare(self._cid)
-        oci.build_bundle(policy, self._bundle, env=env, image_rootfs=image_rootfs)
+        # The bundle gets the *merged* environment, so the container's own
+        # first process is pointed at the proxy too — not only later execs.
+        oci.build_bundle(policy, self._bundle, env=self._base_env,
+                         image_rootfs=image_rootfs)
 
         run_flags = ["run", "-bundle", self._bundle]
         if restore_from:
@@ -194,7 +223,7 @@ class GVisorBackend(Backend):
         # network passthrough boxes need DNS. In image mode `/etc` is the (writable) image,
         # so inject the HOST's current resolver (matches the shared netns — corporate/split/
         # WSL stub, whatever the host uses). Host-bind boxes already see the host's /etc.
-        if policy.network and policy.image:
+        if policy.network != "none" and policy.image:
             self._inject_host_resolv_conf()
 
     def _inject_host_resolv_conf(self) -> None:
@@ -316,6 +345,14 @@ class GVisorBackend(Backend):
                 m.provider.commit(self._cid)
 
     def close(self) -> None:
+        if self._proxy is not None:
+            # Before the box goes: a proxy outliving the only client it had is
+            # a listening socket nobody owns.
+            try:
+                self._proxy.stop()
+            except Exception:  # noqa: BLE001 — teardown must not mask the rest
+                log.warning("egress proxy shutdown failed", exc_info=True)
+            self._proxy = None
         if self._cid and self._state:
             ctl = self._ctl_globals()
             subprocess.run(ctl + ["kill", self._cid, "KILL"], capture_output=True)

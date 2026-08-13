@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "temenos"
-version = "0.3.0"
+version = "0.4.0"
 description = "Untrusted-code containment for a trusted agent — named gVisor boxes with a Python-native policy"
 requires-python = ">=3.11"
 readme = "README.md"

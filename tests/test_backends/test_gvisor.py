@@ -161,3 +161,87 @@ def test_network_off_is_isolated():
 def test_network_host_passthrough_exposes_host_ifaces():
     with Box("t-net-host", Policy(network=True)) as box:
         assert _ifaces(box) - {"lo"}               # host interfaces (eth0, …) present
+
+
+# -- filtered egress ------------------------------------------------------------------
+#
+# These need a real box *and* a real socket, because what is being checked is the join
+# between them: a proxy on the host's loopback, an environment inside the box, and a
+# client that honours it. The allowlist and the proxy have their own pure tests in
+# tests/test_net.py.
+
+def _proxied(name, allow, **kw):
+    return Box(name, Policy(network="filtered", allow_hosts=tuple(allow),
+                            max_cpu_seconds=60, **kw))
+
+
+def _curl(box, url, *, timeout=20):
+    return box.exec(["sh", "-c", f"curl -s --max-time {timeout} {url} 2>&1 | head -2"])
+
+
+def test_filtered_points_the_box_at_its_proxy():
+    with _proxied("t-net-filtered-env", ["example.com"]) as box:
+        r = box.exec(["sh", "-c", "echo $HTTPS_PROXY"])
+        assert r.stdout.strip().startswith("http://127.0.0.1:")
+        # …and the box still shares the host netns, or it could not reach it.
+        assert _ifaces(box) - {"lo"}
+
+
+def test_filtered_refuses_a_host_nobody_listed():
+    """Default-deny, seen from inside the box: the refusal arrives as a body a
+    tool can surface to a model rather than a connection reset."""
+    with _proxied("t-net-filtered-deny", ["example.com"]) as box:
+        out = _curl(box, "http://evil.example/").stdout
+        assert "egress refused" in out and "not in the allowlist" in out
+
+
+def test_filtered_refuses_the_metadata_service():
+    """The reason this feature exists. A box that can be talked into fetching
+    169.254.169.254 is a box that can hand over the instance's credentials."""
+    with _proxied("t-net-filtered-imds", ["example.com"]) as box:
+        out = _curl(box, "http://169.254.169.254/latest/meta-data/").stdout
+        assert "egress refused" in out and "metadata" in out
+
+
+def test_filtered_still_refuses_when_nothing_is_allowed():
+    with _proxied("t-net-filtered-empty", []) as box:
+        assert "egress refused" in _curl(box, "http://example.com/").stdout
+
+
+def test_filtered_does_not_exempt_the_hosts_own_loopback():
+    """The box shares the host netns, so `127.0.0.1` in there is the *host*.
+    A `NO_PROXY=localhost` — the obvious thing to set — would hand every box a
+    direct line to whatever the host runs locally."""
+    import http.server
+    import socketserver
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — stdlib's spelling
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"HOST ONLY")
+
+        def log_message(self, *a):
+            pass
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with _proxied("t-net-filtered-loopback", ["example.com"]) as box:
+            refused = _curl(box, f"http://127.0.0.1:{port}/").stdout
+            assert "egress refused" in refused and "HOST ONLY" not in refused
+
+        # …and it is reachable when somebody names it, like any other host.
+        with _proxied("t-net-filtered-loopback-ok", [f"127.0.0.1:{port}"]) as box:
+            assert "HOST ONLY" in _curl(box, f"http://127.0.0.1:{port}/").stdout
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_filtered_box_reports_its_mode():
+    with _proxied("t-net-filtered-mode", ["example.com"]) as box:
+        assert box.policy.network == "filtered"
+        assert bool(box.policy.network) is True

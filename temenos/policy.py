@@ -19,22 +19,58 @@ from .exceptions import PolicyViolation
 from .storage import Mount
 
 
-def _coerce_network(value: "bool | str") -> bool:
-    """v1 network is a simple toggle: off (False/'none') or full passthrough
-    (True/'host'). No firewalling — filtered allowlists are post-v1."""
+#: Network modes, ordered from least to most reach. `restrict()` may move a box
+#: down this list and never up.
+NETWORK_MODES: tuple[str, ...] = ("none", "filtered", "host")
+
+
+class NetworkMode(str):
+    """The mode, as a string that is still *false* when there is no network.
+
+    v1 shipped ``network: bool`` and the natural way to read it was
+    ``if policy.network:``. A plain string would keep that expression
+    compiling and silently invert it — ``bool("none")`` is ``True`` — which is
+    the worst kind of API change: nothing fails, and an isolated box starts
+    being treated as a connected one. So truthiness keeps meaning exactly what
+    it meant, and the third state is available to anyone who asks for it by
+    name.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return self != "none"
+
+
+def _coerce_network(value: "bool | str") -> NetworkMode:
+    """Three modes, and the v1 booleans still mean what they meant.
+
+    ``False``/``'none'`` — no network at all (isolated netns).
+    ``'filtered'``       — egress via the box's own allowlist proxy.
+    ``True``/``'host'``  — full host passthrough, no filtering.
+
+    Booleans are kept because they were the v1 API and a policy in somebody's
+    config file should not stop parsing when this grew a third state.
+    """
     if isinstance(value, bool):
-        return value
+        return NetworkMode("host" if value else "none")
     if isinstance(value, str):
         s = value.strip().lower()
         if s in ("host", "on", "true", "yes"):
-            return True
+            return NetworkMode("host")
+        if s in ("filtered", "proxy", "allowlist"):
+            return NetworkMode("filtered")
         if s in ("none", "off", "false", "no", ""):
-            return False
-        raise ValueError(f"invalid network mode: {value!r} (use bool or 'host'/'none')")
-    raise ValueError(f"network must be bool or 'host'/'none', got {type(value).__name__}")
+            return NetworkMode("none")
+        raise ValueError(
+            f"invalid network mode: {value!r} (use 'none' | 'filtered' | 'host')"
+        )
+    raise ValueError(
+        f"network must be bool or 'none'/'filtered'/'host', got {type(value).__name__}"
+    )
 
 
-_SET_FIELDS = ("read", "write")
+_SET_FIELDS = ("read", "write", "allow_hosts")
 _INT_FIELDS = ("max_memory_mb", "max_cpu_seconds", "max_processes", "max_output_bytes")
 _ALL_FIELDS = _SET_FIELDS + _INT_FIELDS + ("network",)
 
@@ -51,12 +87,19 @@ class Policy:
     # Explicit provider-backed volumes (memory / disk / fsspec / custom) at chosen paths.
     mounts: tuple[Mount, ...] = ()
 
-    # Network — simple toggle (v1): True = full host passthrough (no firewalling, the
-    # default), False = no network (isolated netns). Filtered allowlists are post-v1.
-    # ⚠️ The True default gives every box full host network reach (localhost, LAN, cloud
-    # metadata, arbitrary egress). Set network=False for adversarial/multi-tenant boxes;
-    # filtered egress is post-v1.
-    network: bool = True
+    # Network — "none" | "filtered" | "host" (bools still accepted: False/True).
+    # ⚠️ The "host" default gives every box full host network reach (localhost, LAN,
+    # cloud metadata, arbitrary egress) with no filtering.
+    # "filtered" routes egress through a per-box allowlist proxy (see `allow_hosts`
+    # and temenos/net/). Read `network_enforced` before trusting it for adversarial
+    # code: today the box is *pointed* at the proxy rather than confined to it.
+    network: str = "host"  # a NetworkMode after __post_init__
+
+    # Hosts reachable in "filtered" mode. Entries are `host` or `host:port`, and a
+    # leading `*.` matches subdomains: ("*.acme.com", "api.stripe.com:443").
+    # Empty means nothing is reachable, which is "none" with extra steps — that is a
+    # coherent thing to configure and it is what a default-deny posture starts from.
+    allow_hosts: tuple[str, ...] = ()
 
     # Box base image (a runner-owned rootfs under $TEMENOS_DATA/images/<name>). None =
     # default host-`/usr`-bind base (read-only system). An image gives a writable system
@@ -92,6 +135,12 @@ class Policy:
             if not isinstance(m, Mount):
                 raise TypeError(f"mounts must contain Mount instances, got {type(m).__name__}")
         object.__setattr__(self, "network", _coerce_network(self.network))
+        if self.allow_hosts and self.network != "filtered":
+            raise ValueError(
+                f"allow_hosts is only meaningful with network='filtered', "
+                f"got network={self.network!r} — a host allowlist that nothing "
+                f"consults reads like containment and is not"
+            )
         if self.image is not None and not isinstance(self.image, str):
             raise TypeError(f"image must be a str name or None, got {type(self.image).__name__}")
         if self.scratch not in ("disk", "memory"):
@@ -138,12 +187,19 @@ class Policy:
                     )
                 merged[field_name] = iv
             else:  # network
-                nb = _coerce_network(value)  # type: ignore[arg-type]
-                if nb and not self.network:
-                    raise PolicyViolation("restrict() cannot enable network (parent has none)")
-                merged[field_name] = nb
+                mode = _coerce_network(value)  # type: ignore[arg-type]
+                if NETWORK_MODES.index(mode) > NETWORK_MODES.index(self.network):
+                    raise PolicyViolation(
+                        f"restrict() cannot widen network: {self.network!r} -> {mode!r}"
+                    )
+                merged[field_name] = mode
         # mounts and image are inherited unchanged (restrict narrows simple capabilities;
         # provider volumes and the base image are not subset-narrowed — see plan).
+        # Narrowing the mode has to take the allowlist with it, or a child that
+        # dropped to "none" would carry hosts nothing consults — and one that
+        # narrowed *to* "filtered" from "host" starts from the parent's list.
+        if merged["network"] != "filtered":
+            merged["allow_hosts"] = ()
         merged["mounts"] = self.mounts
         merged["image"] = self.image
         merged["scratch"] = self.scratch
@@ -180,7 +236,8 @@ class Policy:
         return {
             "read": list(self.read),
             "write": list(self.write),
-            "network": self.network,
+            "network": str(self.network),
+            "allow_hosts": list(self.allow_hosts),
             "mounts": [m.to_dict() for m in self.mounts],
             "image": self.image,
             "scratch": self.scratch,

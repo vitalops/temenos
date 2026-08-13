@@ -31,11 +31,37 @@ On WSL2 that's `ptrace` (no `/dev/kvm`); a bare-metal host gets `kvm`.
 ## Honest limits
 
 ### Network
-Network is **on by default** in v1, and it's a **toggle, not a firewall**: the default is full
-host passthrough — localhost, LAN, cloud metadata, arbitrary egress — with no filtering.
-`--no-net` (`network=False`) fully isolates a box (empty netns). This is the **load-bearing
-gap for adversarial or fleet workloads**: N network-on boxes are an exfiltration surface ×N.
-Run untrusted/multi-tenant boxes with `--no-net`; *filtered* per-host egress is post-v1.
+Three modes, and only two of them are boundaries.
+
+| `network=` | what it is |
+|---|---|
+| `"host"` *(default)* | full host passthrough — localhost, LAN, cloud metadata, arbitrary egress, no filtering |
+| `"filtered"` | egress via a per-box allowlist proxy (`--filtered --allow-host …`). **Cooperative — see below.** |
+| `"none"` | empty netns; no egress at all |
+
+**`filtered` is a control, not a containment boundary.** The box is *pointed* at the
+proxy through `HTTPS_PROXY`, which every well-behaved client honours — `curl`, `pip`,
+`requests`, `git` — and which hostile code simply ignores, because the box shares the
+host's network namespace and can open its own sockets. `EgressProxy.enforced` returns
+`False` and says exactly this.
+
+So use it for what it is: it stops an agent's tools reaching a host nobody allowed, it
+stops `pip install` from talking to the wrong index, and it gives you a metered log of
+every destination a box asked for. It does **not** contain an attacker. For adversarial
+or multi-tenant code the answer is still `--no-net`.
+
+Making it enforcement needs the box in its own network namespace with the proxy as the
+only route out — `pasta` + in-namespace `nft` TPROXY, specified in `plan.md` §13 and not
+built. That, not the proxy, is the remaining work.
+
+Two details worth knowing about `filtered`:
+
+- **Nothing is reachable until something is listed.** An empty allowlist is `none` with
+  extra steps, which is the right place for a default-deny posture to start.
+- **Loopback is not exempt.** There is deliberately no `NO_PROXY`: the box shares the
+  host's netns, so `127.0.0.1` inside it is *the host*, and exempting it would hand every
+  box a direct line to whatever runs there. Name it in `--allow-host 127.0.0.1:PORT` if a
+  box genuinely needs it.
 
 ### Resource limits need systemd delegation
 Memory/CPU/pid caps are enforced by wrapping each box in `systemd-run --user --scope`. This

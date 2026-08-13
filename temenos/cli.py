@@ -144,7 +144,8 @@ def _policy_from_args(args: argparse.Namespace, project) -> Policy:
 
     kwargs: dict[str, object] = dict(
         read=tuple(read), write=tuple(write), mounts=tuple(mounts),
-        network=bool(args.net), scratch=args.scratch, checkpoint=checkpoint,
+        network=_net_mode(args), allow_hosts=tuple(args.allow_host or ()),
+        scratch=args.scratch, checkpoint=checkpoint,
     )
     if args.image:
         kwargs["image"] = args.image
@@ -217,7 +218,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     client = connect_or_spawn()
     info = client.create_box(r.data_dir, policy.to_dict(), name=name)
     print(f"box {name!r} [{r.scope}] id={info['id']} "
-          f"(net={'on' if policy.network else 'off'}, checkpoint={policy.checkpoint})")
+          f"(net={policy.network}, checkpoint={policy.checkpoint})")
     return 0
 
 
@@ -386,8 +387,12 @@ def _shell_banner(name: str, bid: str, scope: str, pol: Policy, data_dir: str) -
     rows = [
         ("box", f"{name}  [{scope}]"),
         ("id", bid),
-        ("network", "on  · full host passthrough" if pol.network
-                    else "off · isolated (no egress)"),
+        ("network", {
+            "host": "host · full host passthrough (no filtering)",
+            "filtered": "filtered · " + (", ".join(pol.allow_hosts) or "nothing allowed")
+                        + "  (cooperative — see docs/security.md)",
+            "none": "none · isolated (no egress)",
+        }[pol.network]),
         ("image", pol.image or "host /usr (read-only)"),
         ("scratch", f"{pol.scratch}  ·  checkpoint={pol.checkpoint}"),
         ("dir", shown_dir),
@@ -558,9 +563,29 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _net_mode(args: argparse.Namespace) -> str:
+    """`--net/--no-net/--filtered/--allow-host` → one of the three modes.
+
+    Naming a host implies filtering. Someone who wrote `--allow-host` wants an
+    allowlist, and the alternative reading — full passthrough, allowlist
+    ignored — is the dangerous one to guess.
+    """
+    if getattr(args, "filtered", False) or getattr(args, "allow_host", None):
+        return "filtered"
+    return "host" if getattr(args, "net", True) else "none"
+
+
 def _add_box_flags(p: argparse.ArgumentParser) -> None:
     """Box-creation flags shared by `create` (and forwarded by `temenos claude` later)."""
     p.add_argument("--image", default=None, help="boot from a built image (see `temenos image`)")
+    p.add_argument("--filtered", action="store_true",
+                   help="egress only to --allow-host entries, via a per-box proxy. "
+                        "COOPERATIVE: honoured by well-behaved clients, ignored by "
+                        "hostile code — use --no-net to contain that.")
+    p.add_argument("--allow-host", action="append", metavar="HOST[:PORT]",
+                   help="a host a --filtered box may reach; implies --filtered. "
+                        "`*.acme.com` matches subdomains. Repeatable; nothing is "
+                        "reachable until something is listed.")
     p.add_argument("--net", "--network", dest="net", default=True,
                    action=argparse.BooleanOptionalAction,
                    help="host network passthrough (ON by default; use --no-net to isolate)")

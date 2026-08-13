@@ -105,11 +105,14 @@ def make_config(policy: Policy, init_cmd: list[str], env: dict[str, str] | None,
         "hostname": "temenos",
         "mounts": _mounts(policy, host_system=host_system),
         "linux": {
-            # Drop the network namespace for passthrough (network=True) so the box shares
-            # the host netns; keep it (isolated, empty) for network=False. Pairs with the
+            # Drop the network namespace for anything but network='none', so the box
+            # shares the host netns; keep it (isolated, empty) otherwise. Pairs with the
             # backend's --network=host|none (both are required — verified).
+            # 'filtered' shares the netns too: the proxy it is pointed at listens on the
+            # host's loopback, and a box in its own empty namespace could not reach it.
+            # That sharing is also exactly why filtered is cooperative — see plan §13.
             "namespaces": [{"type": t} for t in
-                           (("pid", "mount", "ipc", "uts") if policy.network
+                           (("pid", "mount", "ipc", "uts") if policy.network != "none"
                             else ("pid", "mount", "ipc", "uts", "network"))],
             # Harmless under rootless --ignore-cgroups; real enforcement is the systemd
             # scope the backend wraps the box in (D6).
